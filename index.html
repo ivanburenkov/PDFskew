@@ -106,107 +106,147 @@
   </div>
 
   <script>
-    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-    let originalCanvas = document.createElement('canvas');
-    let viewCanvas = document.getElementById('viewport-canvas');
-    let viewCtx = viewCanvas.getContext('2d');
+  // High-resolution offscreen canvas (for processing & export)
+  let hiResCanvas = document.createElement('canvas');
+  let hiResCtx = hiResCanvas.getContext('2d');
+
+  // Preview canvas (on screen)
+  let viewCanvas = document.getElementById('viewport-canvas');
+  let viewCtx = viewCanvas.getContext('2d');
+  
+  const fileInput = document.getElementById('file-input');
+  const slider = document.getElementById('angle-slider');
+  const angleInput = document.getElementById('angle-input');
+  const resetBtn = document.getElementById('reset-btn');
+  const downloadBtn = document.getElementById('download-btn');
+  const gridOverlay = document.getElementById('grid-overlay');
+  const toggleGrid = document.getElementById('toggle-grid');
+
+  let currentAngle = 0;
+  let originalPdfDoc = null;
+  let rawPage = null;
+  let ptWidth = 0;
+  let ptHeight = 0;
+
+  // 300 DPI target scale (300 / 72 ≈ 4.167)
+  const EXPORT_SCALE = 300 / 72;
+
+  toggleGrid.addEventListener('change', (e) => {
+    gridOverlay.style.display = e.target.checked ? 'block' : 'none';
+  });
+
+  fileInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    downloadBtn.textContent = 'Rendering...';
+    downloadBtn.disabled = true;
+
+    const fileBuffer = await file.arrayBuffer();
+    originalPdfDoc = await pdfjsLib.getDocument({ data: fileBuffer }).promise;
+    rawPage = await originalPdfDoc.getPage(1);
+
+    // Get unscaled standard PDF points
+    const unscaledViewport = rawPage.getViewport({ scale: 1.0 });
+    ptWidth = unscaledViewport.width;
+    ptHeight = unscaledViewport.height;
+
+    // Render internal buffer at 300 DPI
+    const hiResViewport = rawPage.getViewport({ scale: EXPORT_SCALE });
+    hiResCanvas.width = Math.round(hiResViewport.width);
+    hiResCanvas.height = Math.round(hiResViewport.height);
+
+    await rawPage.render({ canvasContext: hiResCtx, viewport: hiResViewport }).promise;
+
+    // Set screen preview display size
+    const screenScale = Math.min(window.innerWidth * 0.75 / ptWidth, (window.innerHeight - 150) / ptHeight, 1.5);
+    viewCanvas.width = Math.round(ptWidth * screenScale);
+    viewCanvas.height = Math.round(ptHeight * screenScale);
+
+    slider.disabled = false;
+    angleInput.disabled = false;
+    resetBtn.disabled = false;
+    downloadBtn.disabled = false;
+    downloadBtn.textContent = 'Export Deskewed PDF';
     
-    const fileInput = document.getElementById('file-input');
-    const slider = document.getElementById('angle-slider');
-    const angleInput = document.getElementById('angle-input');
-    const resetBtn = document.getElementById('reset-btn');
-    const downloadBtn = document.getElementById('download-btn');
-    const gridOverlay = document.getElementById('grid-overlay');
-    const toggleGrid = document.getElementById('toggle-grid');
+    currentAngle = 0;
+    slider.value = 0;
+    angleInput.value = 0;
 
-    let currentAngle = 0;
-    let originalPdfDoc = null;
-    let baseWidth = 0;
-    let baseHeight = 0;
+    renderRotatedPreview(0);
+  });
 
-    toggleGrid.addEventListener('change', (e) => {
-      gridOverlay.style.display = e.target.checked ? 'block' : 'none';
+  function setAngle(val) {
+    currentAngle = parseFloat(val) || 0;
+    slider.value = currentAngle;
+    angleInput.value = currentAngle;
+    renderRotatedPreview(currentAngle);
+  }
+
+  slider.addEventListener('input', (e) => setAngle(e.target.value));
+  angleInput.addEventListener('input', (e) => setAngle(e.target.value));
+  resetBtn.addEventListener('click', () => setAngle(0));
+
+  function renderRotatedPreview(deg) {
+    if (!viewCanvas.width) return;
+    const rad = (deg * Math.PI) / 180;
+    const w = viewCanvas.width;
+    const h = viewCanvas.height;
+
+    viewCtx.save();
+    viewCtx.fillStyle = '#ffffff';
+    viewCtx.fillRect(0, 0, w, h);
+
+    viewCtx.translate(w / 2, h / 2);
+    viewCtx.rotate(rad);
+    // Draw from the high-res buffer down to the viewport canvas with smoothing
+    viewCtx.imageSmoothingEnabled = true;
+    viewCtx.imageSmoothingQuality = 'high';
+    viewCtx.drawImage(hiResCanvas, -w / 2, -h / 2, w, h);
+    viewCtx.restore();
+  }
+
+  downloadBtn.addEventListener('click', () => {
+    downloadBtn.textContent = 'Generating PDF...';
+    downloadBtn.disabled = true;
+
+    // Process rotation on the full 300 DPI canvas
+    const exportCanvas = document.createElement('canvas');
+    exportCanvas.width = hiResCanvas.width;
+    exportCanvas.height = hiResCanvas.height;
+    const exportCtx = exportCanvas.getContext('2d');
+
+    exportCtx.fillStyle = '#ffffff';
+    exportCtx.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
+
+    const rad = (currentAngle * Math.PI) / 180;
+    exportCtx.save();
+    exportCtx.translate(exportCanvas.width / 2, exportCanvas.height / 2);
+    exportCtx.rotate(rad);
+    exportCtx.imageSmoothingEnabled = true;
+    exportCtx.imageSmoothingQuality = 'high';
+    exportCtx.drawImage(hiResCanvas, -exportCanvas.width / 2, -exportCanvas.height / 2);
+    exportCtx.restore();
+
+    // Export to PDF with original point dimensions
+    const { jsPDF } = window.jspdf;
+    const orientation = ptWidth > ptHeight ? 'landscape' : 'portrait';
+    const pdf = new jsPDF({
+      orientation: orientation,
+      unit: 'pt',
+      format: [ptWidth, ptHeight]
     });
 
-    fileInput.addEventListener('change', async (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
+    // Use lossless PNG or highest-quality JPEG to prevent scan compression artifacts
+    const imgData = exportCanvas.toDataURL('image/png');
+    pdf.addImage(imgData, 'PNG', 0, 0, ptWidth, ptHeight, undefined, 'FAST');
+    pdf.save('aligned_document_300dpi.pdf');
 
-      const fileBuffer = await file.arrayBuffer();
-      originalPdfDoc = await pdfjsLib.getDocument({ data: fileBuffer }).promise;
-      
-      // Render first page at high DPI (scale = 2.0) for crisp rendering
-      const page = await originalPdfDoc.getPage(1);
-      const viewport = page.getViewport({ scale: 2.0 });
-
-      baseWidth = viewport.width;
-      baseHeight = viewport.height;
-      originalCanvas.width = baseWidth;
-      originalCanvas.height = baseHeight;
-
-      const renderCtx = originalCanvas.getContext('2d');
-      await page.render({ canvasContext: renderCtx, viewport: viewport }).promise;
-
-      // Enable controls
-      slider.disabled = false;
-      angleInput.disabled = false;
-      resetBtn.disabled = false;
-      downloadBtn.disabled = false;
-      currentAngle = 0;
-      slider.value = 0;
-      angleInput.value = 0;
-
-      renderRotatedPreview(0);
-    });
-
-    function setAngle(val) {
-      currentAngle = parseFloat(val) || 0;
-      slider.value = currentAngle;
-      angleInput.value = currentAngle;
-      renderRotatedPreview(currentAngle);
-    }
-
-    slider.addEventListener('input', (e) => setAngle(e.target.value));
-    angleInput.addEventListener('input', (e) => setAngle(e.target.value));
-
-    resetBtn.addEventListener('click', () => setAngle(0));
-
-    function renderRotatedPreview(deg) {
-      if (!baseWidth) return;
-
-      const rad = (deg * Math.PI) / 180;
-      
-      // Keep canvas boundaries fixed to original page dimensions (cropping outer corners with white fill)
-      viewCanvas.width = baseWidth;
-      viewCanvas.height = baseHeight;
-
-      viewCtx.fillStyle = '#ffffff';
-      viewCtx.fillRect(0, 0, baseWidth, baseHeight);
-
-      // Rotate around document center
-      viewCtx.save();
-      viewCtx.translate(baseWidth / 2, baseHeight / 2);
-      viewCtx.rotate(rad);
-      viewCtx.drawImage(originalCanvas, -baseWidth / 2, -baseHeight / 2);
-      viewCtx.restore();
-    }
-
-    downloadBtn.addEventListener('click', () => {
-      const { jsPDF } = window.jspdf;
-      
-      // Determine orientation based on aspect ratio
-      const orientation = baseWidth > baseHeight ? 'landscape' : 'portrait';
-      const pdf = new jsPDF({
-        orientation: orientation,
-        unit: 'px',
-        format: [baseWidth, baseHeight]
-      });
-
-      const imgData = viewCanvas.toDataURL('image/jpeg', 0.95);
-      pdf.addImage(imgData, 'JPEG', 0, 0, baseWidth, baseHeight);
-      pdf.save('aligned_document.pdf');
-    });
-  </script>
+    downloadBtn.textContent = 'Export Deskewed PDF';
+    downloadBtn.disabled = false;
+  });
+</script>
 </body>
 </html>
